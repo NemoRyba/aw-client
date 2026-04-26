@@ -267,17 +267,33 @@ class ActivityWatchClient:
     def get_buckets(self) -> dict:
         return self._get("buckets/").json()
 
-    def create_bucket(self, bucket_id: str, event_type: str, queued=False):
+    def create_bucket(
+        self,
+        bucket_id: str,
+        event_type: str,
+        queued: bool = False,
+        data: Optional[Dict[str, Any]] = None,
+        hostname: Optional[str] = None,
+        client_name: Optional[str] = None,
+    ):
         if queued:
-            self.request_queue.register_bucket(bucket_id, event_type)
+            self.request_queue.register_bucket(
+                bucket_id,
+                event_type,
+                data=data,
+                hostname=hostname,
+                client_name=client_name,
+            )
         else:
             endpoint = f"buckets/{bucket_id}"
-            data = {
-                "client": self.client_name,
-                "hostname": self.client_hostname,
+            payload = {
+                "client": client_name or self.client_name,
+                "hostname": hostname or self.client_hostname,
                 "type": event_type,
             }
-            self._post(endpoint, data)
+            if data is not None:
+                payload["data"] = data
+            self._post(endpoint, payload)
 
     def delete_bucket(self, bucket_id: str, force: bool = False):
         self._delete(f"buckets/{bucket_id}" + ("?force=1" if force else ""))
@@ -388,7 +404,7 @@ class ActivityWatchClient:
 
 
 QueuedRequest = namedtuple("QueuedRequest", ["endpoint", "data"])
-Bucket = namedtuple("Bucket", ["id", "type"])
+Bucket = namedtuple("Bucket", ["id", "type", "client_name", "hostname", "data"])
 
 
 class RequestQueue(threading.Thread):
@@ -452,7 +468,13 @@ class RequestQueue(threading.Thread):
 
     def _create_buckets(self) -> None:
         for bucket in self._registered_buckets:
-            self.client.create_bucket(bucket.id, bucket.type)
+            self.client.create_bucket(
+                bucket.id,
+                bucket.type,
+                hostname=bucket.hostname,
+                client_name=bucket.client_name,
+                data=bucket.data,
+            )
 
     def _try_connect(self) -> bool:
         try:  # Try to connect
@@ -544,5 +566,14 @@ class RequestQueue(threading.Thread):
         assert isinstance(data, dict)
         self._persistqueue.put(QueuedRequest(endpoint, data))
 
-    def register_bucket(self, bucket_id: str, event_type: str) -> None:
-        self._registered_buckets.append(Bucket(bucket_id, event_type))
+    def register_bucket(
+        self,
+        bucket_id: str,
+        event_type: str,
+        data: Optional[Dict[str, Any]] = None,
+        hostname: Optional[str] = None,
+        client_name: Optional[str] = None,
+    ) -> None:
+        self._registered_buckets.append(
+            Bucket(bucket_id, event_type, client_name, hostname, data)
+        )
