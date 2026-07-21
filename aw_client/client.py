@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import threading
+import warnings
 from collections import namedtuple
 from datetime import datetime
 from time import sleep
@@ -23,7 +24,7 @@ from aw_core.dirs import get_data_dir
 from aw_core.models import Event
 from aw_transform.heartbeats import heartbeat_merge
 
-from .config import load_config
+from .config import load_config, load_local_server_api_key
 from .singleinstance import SingleInstance
 
 # FIXME: This line is probably badly placed
@@ -88,6 +89,7 @@ class ActivityWatchClient:
 
         server_host = host or server_config["hostname"]
         server_port = port or server_config["port"]
+        self.server_api_key = load_local_server_api_key(str(server_host), server_port)
         self.server_address = f"{protocol}://{server_host}:{server_port}"
 
         self.instance = SingleInstance(
@@ -99,6 +101,7 @@ class ActivityWatchClient:
         self.request_queue = RequestQueue(self)
         # Dict of each last heartbeat in each bucket
         self.last_heartbeat = {}  # type: Dict[str, Event]
+        self._warned_queue_before_connect = False
 
     #
     #   Get/Post base requests
@@ -107,9 +110,15 @@ class ActivityWatchClient:
     def _url(self, endpoint: str):
         return f"{self.server_address}/api/0/{endpoint}"
 
+    def _headers(self, headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        request_headers = dict(headers or {})
+        if self.server_api_key:
+            request_headers.setdefault("Authorization", f"Bearer {self.server_api_key}")
+        return request_headers
+
     @always_raise_for_request_errors
     def _get(self, endpoint: str, params: Optional[dict] = None) -> req.Response:
-        return req.get(self._url(endpoint), params=params)
+        return req.get(self._url(endpoint), params=params, headers=self._headers())
 
     @always_raise_for_request_errors
     def _post(
@@ -118,7 +127,9 @@ class ActivityWatchClient:
         data: Union[List[Any], Dict[str, Any]],
         params: Optional[dict] = None,
     ) -> req.Response:
-        headers = {"Content-type": "application/json", "charset": "utf-8"}
+        headers = self._headers(
+            {"Content-type": "application/json", "charset": "utf-8"}
+        )
         return req.post(
             self._url(endpoint),
             data=bytes(json.dumps(data), "utf8"),
@@ -130,7 +141,7 @@ class ActivityWatchClient:
     def _delete(self, endpoint: str, data: Any = None) -> req.Response:
         if data is None:
             data = {}
-        headers = {"Content-type": "application/json"}
+        headers = self._headers({"Content-type": "application/json"})
         return req.delete(self._url(endpoint), data=json.dumps(data), headers=headers)
 
     def get_info(self):
@@ -234,6 +245,7 @@ class ActivityWatchClient:
         _commit_interval = commit_interval or self.commit_interval
 
         if queued:
+            self._warn_queue_before_connect()
             # Pre-merge heartbeats
             if bucket_id not in self.last_heartbeat:
                 self.last_heartbeat[bucket_id] = event
@@ -277,6 +289,7 @@ class ActivityWatchClient:
         client_name: Optional[str] = None,
     ):
         if queued:
+            self._warn_queue_before_connect()
             self.request_queue.register_bucket(
                 bucket_id,
                 event_type,
@@ -387,6 +400,8 @@ class ActivityWatchClient:
 
         # Throw away old thread object, create new one since same thread cannot be started twice
         self.request_queue = RequestQueue(self)
+        # Reset so warn-before-connect fires again if user calls queued ops before reconnecting
+        self._warned_queue_before_connect = False
 
     def wait_for_start(self, timeout: int = 10) -> None:
         """Wait for the server to start by trying to get the server info."""
@@ -401,6 +416,18 @@ class ActivityWatchClient:
                 sleep_time *= 2
         else:
             raise Exception(f"Server at {self.server_address} did not start in time")
+
+    def _warn_queue_before_connect(self) -> None:
+        if self._warned_queue_before_connect or self.request_queue.is_alive():
+            return
+
+        warnings.warn(
+            "Queued requests require calling connect() or using `with client:` "
+            "before buckets can be created and queued events can flush.",
+            UserWarning,
+            stacklevel=3,
+        )
+        self._warned_queue_before_connect = True
 
 
 QueuedRequest = namedtuple("QueuedRequest", ["endpoint", "data"])
@@ -574,6 +601,24 @@ class RequestQueue(threading.Thread):
         hostname: Optional[str] = None,
         client_name: Optional[str] = None,
     ) -> None:
-        self._registered_buckets.append(
-            Bucket(bucket_id, event_type, client_name, hostname, data)
-        )
+        bucket = Bucket(bucket_id, event_type, client_name, hostname, data)
+        self._registered_buckets.append(bucket)
+
+        if not self.connected:
+            return
+
+        try:
+            kwargs = {}
+            if data is not None:
+                kwargs["data"] = data
+            if hostname is not None:
+                kwargs["hostname"] = hostname
+            if client_name is not None:
+                kwargs["client_name"] = client_name
+            self.client.create_bucket(
+                bucket_id,
+                event_type,
+                **kwargs,
+            )
+        except req.RequestException:
+            self.connected = False
