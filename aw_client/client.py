@@ -529,12 +529,10 @@ class RequestQueue(threading.Thread):
 
         try:
             self.client._post(request.endpoint, request.data)
-        except req.exceptions.ConnectTimeout:
+        except (req.exceptions.ConnectionError, req.exceptions.Timeout):
             # Triggered by:
             #   - server not running (connection refused)
             #   - server not responding (timeout)
-            # Safe to retry according to requests docs:
-            #   https://requests.readthedocs.io/en/latest/api/#requests.ConnectTimeout
 
             self.connected = False
             logger.warning(

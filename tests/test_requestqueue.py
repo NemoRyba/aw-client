@@ -88,3 +88,19 @@ def test_register_bucket_marks_queue_disconnected_on_create_failure():
 
     assert rq.connected is False
     assert client.create_bucket_calls == [(("test-bucket", "test-type"), {})]
+
+
+def test_connection_loss_keeps_request_in_queue():
+    class FailingClient(MockClient):
+        def _post(self, *args, **kwargs):
+            raise requests.exceptions.ConnectionError()
+
+    client = FailingClient()
+    rq = RequestQueue(client)  # type: ignore
+    rq.connected = True
+    rq.add_request("/api/0/buckets/test/heartbeat", {"data": "queued"})
+
+    rq._dispatch_request()
+
+    assert rq.connected is False
+    assert rq._get_next().data == {"data": "queued"}
