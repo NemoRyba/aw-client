@@ -24,7 +24,7 @@ from aw_core.dirs import get_data_dir
 from aw_core.models import Event
 from aw_transform.heartbeats import heartbeat_merge
 
-from .config import load_config, load_local_server_api_key
+from .config import load_config, load_fleet_token, load_local_server_api_key
 from .singleinstance import SingleInstance
 
 # FIXME: This line is probably badly placed
@@ -89,7 +89,11 @@ class ActivityWatchClient:
 
         server_host = host or server_config["hostname"]
         server_port = port or server_config["port"]
-        self.server_api_key = load_local_server_api_key(str(server_host), server_port)
+        # The local aw-server-rust key only ever applies to localhost; for a
+        # central fleet server the credential is the fleet token.
+        self.server_api_key = load_local_server_api_key(
+            str(server_host), server_port
+        ) or load_fleet_token(_config)
         self.server_address = f"{protocol}://{server_host}:{server_port}"
 
         self.instance = SingleInstance(
@@ -555,6 +559,19 @@ class RequestQueue(threading.Thread):
                 # in which case we want to retry. I hope this can never caused by a bad payload.
                 logger.error(f"Internal server error, retrying: {request.data}")
                 sleep(0.5)
+                return
+            elif e.response is not None and e.response.status_code in (401, 403):
+                # Missing or wrong fleet token. This is a configuration
+                # problem, not a bad payload - dropping the event would lose
+                # the recording permanently, so keep it queued until the token
+                # is fixed and back off so the log does not fill up.
+                logger.error(
+                    "Not authorized by the server (HTTP %s). Keeping events "
+                    "queued - check the fleet token on this device.",
+                    e.response.status_code,
+                )
+                self.connected = False
+                sleep(5)
                 return
             else:
                 logger.exception(f"Unknown error, not retrying: {request.data}")
